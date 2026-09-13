@@ -271,21 +271,42 @@ struct UsrAIStrategy::Impl
         }
     };
 
+    struct PriestRetreatPlan {
+        int targetX;
+        int targetY;
+        int towerSN;
+        int holdUntilFrame;
+        int lastX;
+        int lastY;
+        int lastProgressFrame;
+        bool valid;
+
+        PriestRetreatPlan()
+            : targetX(-1), targetY(-1), towerSN(-1),
+              holdUntilFrame(-1), lastX(-1), lastY(-1),
+              lastProgressFrame(-1000), valid(false)
+        {
+        }
+    };
+
     int lastFrame;
     int lastBuildFrame;
     int lastCenterOrderFrame;
     int lastMilitaryOrderFrame;
     int lastTelemetryFrame;
+    int lastEnemyArmySeenFrame;
     map<int, BuildAttempt> buildAttempts;
     map<int, pair<int, int> > technologyAttempts;
     map<int, set<int> > rejectedSites;
     map<int, int> lastUnitOrderFrame;
     map<int, int> priestWaypointIndex;
     map<int, int> lastArmyBlood;
+    map<int, PriestRetreatPlan> priestRetreatPlans;
     map<int, WorkerLease> workerLeases;
     WorkerBlackboard workerBlackboard;
     set<int> formerBerryWorkers;
     set<int> huntWorkers;
+    set<int> goldTransferWorkers;
     set<int> herdGazelles;
     set<int> priestsInDanger;
     set<int> priestsUnderDirectThreat;
@@ -305,6 +326,10 @@ struct UsrAIStrategy::Impl
     int currentGazelleSN;
     int armyScoutSN;
     int armyScoutWaypoint;
+    int armyScoutLastX;
+    int armyScoutLastY;
+    int armyScoutLastProgressFrame;
+    int priestGuardSN;
     TrackedTechnology towerResearch;
     TrackedTechnology broadswordResearch;
     TrackedTechnology towerUpgrade;
@@ -315,7 +340,7 @@ struct UsrAIStrategy::Impl
     Impl()
         : lastFrame(-1), lastBuildFrame(-1000), lastCenterOrderFrame(-1000),
           lastMilitaryOrderFrame(-1000),
-          lastTelemetryFrame(-1000),
+          lastTelemetryFrame(-1000), lastEnemyArmySeenFrame(-1000),
           firstWaveEngaged(false), firstWaveCleared(false),
           sawHomeBerries(false), homeBerriesDepleted(false),
           huntAnchorValid(false), firstGazelleKilled(false), herdKilled(false),
@@ -323,6 +348,8 @@ struct UsrAIStrategy::Impl
           huntAnchorX(-1), huntAnchorY(-1),
           goldAnchorX(-1), goldAnchorY(-1), currentGazelleSN(-1),
           armyScoutSN(-1), armyScoutWaypoint(0),
+          armyScoutLastX(-1), armyScoutLastY(-1),
+          armyScoutLastProgressFrame(-1000), priestGuardSN(-1),
           towerResearch(BUILDING_GRANARY_ARROWTOWER),
           broadswordResearch(BUILDING_ARMYCAMP_UPGRADE_BROADSWORD),
           towerUpgrade(BUILDING_GRANARY_ARROWTOWE_UPGRADE),
@@ -387,6 +414,13 @@ struct UsrAIStrategy::Impl
             else
                 ++it;
         }
+        for (set<int>::iterator it = goldTransferWorkers.begin();
+             it != goldTransferWorkers.end();) {
+            if (alive.count(*it) == 0)
+                it = goldTransferWorkers.erase(it);
+            else
+                ++it;
+        }
     }
 
     void dispatchWorkerBlackboard(UsrAI& ai, const tagInfo& info)
@@ -447,8 +481,18 @@ struct UsrAIStrategy::Impl
                 lease.state = 1;
 
             const int sinceIssue = info.GameFrame - lease.issuedFrame;
+            int idleRetryDelay = 30;
+            if (intent.taskKind == WORKER_TASK_DEPOSIT)
+                idleRetryDelay = 100;
+            else if (intent.taskKind == WORKER_TASK_HUNT
+                || intent.taskKind == WORKER_TASK_GATHER
+                || intent.taskKind == WORKER_TASK_FARM)
+                idleRetryDelay = 75;
+            else if (intent.taskKind == WORKER_TASK_REPAIR)
+                idleRetryDelay = 100;
             const bool unexpectedIdle = intent.commandKind == WORKER_COMMAND_ACTION
-                && worker->NowState == HUMAN_STATE_IDLE && sinceIssue > 30;
+                && worker->NowState == HUMAN_STATE_IDLE
+                && sinceIssue > idleRetryDelay;
             const bool stalled = !moveComplete && !productive
                 && info.GameFrame - lease.lastProgressFrame > 120
                 && sinceIssue > 30;
@@ -631,6 +675,52 @@ struct UsrAIStrategy::Impl
         return make_pair(MAP_L / 2, MAP_U / 2);
     }
 
+    bool openMovementPoint(const tagInfo& info, int x, int y) const
+    {
+        if (x < 0 || y < 0 || x >= MAP_L || y >= MAP_U
+            || info.theMap == NULL || (*info.theMap)[x][y].height < 0)
+            return false;
+        for (const tagBuilding& building : info.buildings) {
+            const int side = buildingSide(building.Type);
+            if (x >= building.BlockDR && x < building.BlockDR + side
+                && y >= building.BlockUR && y < building.BlockUR + side)
+                return false;
+        }
+        for (const tagBuilding& building : info.enemy_buildings) {
+            const int side = buildingSide(building.Type);
+            if (x >= building.BlockDR && x < building.BlockDR + side
+                && y >= building.BlockUR && y < building.BlockUR + side)
+                return false;
+        }
+        for (const tagResource& resource : info.resources) {
+            if (resource.Cnt > 0 && resource.BlockDR == x
+                && resource.BlockUR == y)
+                return false;
+        }
+        return true;
+    }
+
+    pair<int, int> dispersedBasePoint(const tagInfo& info, int unitSN) const
+    {
+        const pair<int, int> center = centerBlock(info);
+        static const int offsets[][2] = {
+            { 5, 1 }, { 5, 4 }, { 1, 5 }, { -3, 5 },
+            { -4, 1 }, { -4, -3 }, { 1, -4 }, { 5, -3 }
+        };
+        const int count = int(sizeof(offsets) / sizeof(offsets[0]));
+        const int first = (unitSN < 0 ? -unitSN : unitSN) % count;
+        for (int attempt = 0; attempt < count; ++attempt) {
+            const int slot = (first + attempt) % count;
+            const int x = max(0, min(MAP_L - 1,
+                                     center.first + offsets[slot][0]));
+            const int y = max(0, min(MAP_U - 1,
+                                     center.second + offsets[slot][1]));
+            if (openMovementPoint(info, x, y))
+                return make_pair(x, y);
+        }
+        return center;
+    }
+
     pair<int, int> resourceAnchor(const tagInfo& info, int type,
                                   const pair<int, int>& center) const
     {
@@ -716,6 +806,71 @@ struct UsrAIStrategy::Impl
         return false;
     }
 
+    bool hasStockNearPoint(const tagInfo& info, int pointX, int pointY,
+                           bool finishedOnly, int radius = 12) const
+    {
+        for (const tagBuilding& building : info.buildings) {
+            if (building.Type == BUILDING_STOCK
+                && (!finishedOnly || building.Percent >= 100)
+                && distance2(building.BlockDR, building.BlockUR,
+                             pointX, pointY) <= radius * radius)
+                return true;
+        }
+        return false;
+    }
+
+    bool readyForHerdStock(const tagInfo& info) const
+    {
+        if (homeBerriesDepleted)
+            return true;
+        const pair<int, int> center = centerBlock(info);
+        int remainingFood = 0;
+        for (const tagResource& resource : info.resources) {
+            if (resource.Type == RESOURCE_BUSH && resource.Cnt > 0
+                && distance2(center.first, center.second,
+                             resource.BlockDR, resource.BlockUR)
+                    <= kHomeBerryRadius * kHomeBerryRadius)
+                remainingFood += resource.Cnt;
+        }
+        return sawHomeBerries && remainingFood <= 150;
+    }
+
+    bool selectedRemoteStockAnchor(const tagInfo& info,
+                                   int& resourceX, int& resourceY) const
+    {
+        if (readyForHerdStock(info) && huntAnchorValid
+            && !hasStockNearPoint(info, huntAnchorX, huntAnchorY, false, 10)) {
+            resourceX = huntAnchorX;
+            resourceY = huntAnchorY;
+            return true;
+        }
+        if (goldAnchorValid
+            && info.civilizationStage >= CIVILIZATION_BRONZEAGE
+            && info.enemy_armies.empty()
+            && !hasStockNearPoint(info, goldAnchorX, goldAnchorY, false)) {
+            resourceX = goldAnchorX;
+            resourceY = goldAnchorY;
+            return true;
+        }
+        return false;
+    }
+
+    pair<int, int> baseFacingResourceAnchor(const tagInfo& info,
+                                             int resourceX,
+                                             int resourceY) const
+    {
+        const pair<int, int> center = centerBlock(info);
+        const int dx = center.first - resourceX;
+        const int dy = center.second - resourceY;
+        const int stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+        const int stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+        if (abs(dx) >= abs(dy))
+            return make_pair(resourceX + stepX * 7,
+                             resourceY + stepY * 3);
+        return make_pair(resourceX + stepX * 3,
+                         resourceY + stepY * 7);
+    }
+
     pair<int, int> frontLineAnchor(const tagInfo& info) const
     {
         const pair<int, int> center = centerBlock(info);
@@ -787,19 +942,16 @@ struct UsrAIStrategy::Impl
     pair<int, int> preferredAnchor(const tagInfo& info, int type) const
     {
         const pair<int, int> center = centerBlock(info);
-        if (type == BUILDING_STOCK && huntAnchorValid) {
+        int remoteResourceX = -1;
+        int remoteResourceY = -1;
+        if (type == BUILDING_STOCK
+            && selectedRemoteStockAnchor(info, remoteResourceX,
+                                         remoteResourceY)) {
             // Put the hunting stock on the base-facing side of the herd.  A
             // small gap around the carcasses prevents gatherers and returning
             // villagers from trying to cross through the same crowded tiles.
-            const int dx = center.first - huntAnchorX;
-            const int dy = center.second - huntAnchorY;
-            const int stepX = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
-            const int stepY = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
-            if (abs(dx) >= abs(dy))
-                return make_pair(huntAnchorX + stepX * 7,
-                                 huntAnchorY + stepY * 3);
-            return make_pair(huntAnchorX + stepX * 3,
-                             huntAnchorY + stepY * 7);
+            return baseFacingResourceAnchor(info, remoteResourceX,
+                                             remoteResourceY);
         }
         if (type == BUILDING_GRANARY || type == BUILDING_STOCK)
             return resourceAnchor(info, type, center);
@@ -909,24 +1061,29 @@ struct UsrAIStrategy::Impl
             return false;
         }
 
-        if (type == BUILDING_STOCK && huntAnchorValid) {
+        int remoteResourceX = -1;
+        int remoteResourceY = -1;
+        if (type == BUILDING_STOCK
+            && selectedRemoteStockAnchor(info, remoteResourceX,
+                                         remoteResourceY)) {
             const pair<int, int> center = centerBlock(info);
-            const int deltaX = center.first - huntAnchorX;
-            const int deltaY = center.second - huntAnchorY;
+            const int deltaX = center.first - remoteResourceX;
+            const int deltaY = center.second - remoteResourceY;
             const int step = (deltaX != 0 && deltaY != 0) ? 5 : 7;
-            const int desiredX = huntAnchorX
+            const int desiredX = remoteResourceX
                 + (deltaX > 0 ? step : (deltaX < 0 ? -step : 0));
-            const int desiredY = huntAnchorY
+            const int desiredY = remoteResourceY
                 + (deltaY > 0 ? step : (deltaY < 0 ? -step : 0));
             long bestScore = numeric_limits<long>::max();
             bool found = false;
-            for (int candidateX = huntAnchorX - 10;
-                 candidateX <= huntAnchorX + 10; ++candidateX) {
-                for (int candidateY = huntAnchorY - 10;
-                     candidateY <= huntAnchorY + 10; ++candidateY) {
-                    const int herdDistance = distance2(candidateX, candidateY,
-                                                       huntAnchorX, huntAnchorY);
-                    if (herdDistance < 5 * 5 || herdDistance > 10 * 10
+            for (int candidateX = remoteResourceX - 10;
+                 candidateX <= remoteResourceX + 10; ++candidateX) {
+                for (int candidateY = remoteResourceY - 10;
+                     candidateY <= remoteResourceY + 10; ++candidateY) {
+                    const int resourceDistance = distance2(candidateX, candidateY,
+                                                           remoteResourceX,
+                                                           remoteResourceY);
+                    if (resourceDistance < 5 * 5 || resourceDistance > 10 * 10
                         || !validSite(info, type, candidateX, candidateY))
                         continue;
                     int nearbyObstacles = 0;
@@ -983,6 +1140,21 @@ struct UsrAIStrategy::Impl
                 && building.Blood < building.MaxBlood);
     }
 
+    bool buildingShouldReceiveWorkers(const tagInfo& info,
+                                      const tagBuilding& building) const
+    {
+        if (!buildingNeedsWorkers(building))
+            return false;
+        if (building.Percent < 100 || info.enemy_armies.empty())
+            return true;
+        // Do not repeatedly pull the economy onto buildings that lose a few
+        // hit points every combat tick.  Only emergency-repair a badly damaged
+        // tower while enemies are present; ordinary repairs resume afterwards.
+        return building.Type == BUILDING_ARROWTOWER
+            && building.MaxBlood > 0
+            && building.Blood * 100 < building.MaxBlood * 55;
+    }
+
     int activeBuilderCount(const tagInfo& info) const
     {
         int result = 0;
@@ -990,7 +1162,7 @@ struct UsrAIStrategy::Impl
             if (farmer.FarmerSort != FARMERTYPE_FARMER)
                 continue;
             const tagBuilding* target = findBuildingBySN(info, farmer.WorkObjectSN);
-            if (target != NULL && buildingNeedsWorkers(*target)
+            if (target != NULL && buildingShouldReceiveWorkers(info, *target)
                 && !workerLeaseBlocked(farmer.SN, target->SN))
                 ++result;
         }
@@ -1029,7 +1201,7 @@ struct UsrAIStrategy::Impl
             if (farmer.FarmerSort != FARMERTYPE_FARMER)
                 continue;
             const tagBuilding* target = findBuildingBySN(info, farmer.WorkObjectSN);
-            if (target != NULL && buildingNeedsWorkers(*target)
+            if (target != NULL && buildingShouldReceiveWorkers(info, *target)
                 && !workerLeaseBlocked(farmer.SN, target->SN)) {
                 ++workersPerBuilding[target->SN];
                 ++totalBuilders;
@@ -1046,7 +1218,7 @@ struct UsrAIStrategy::Impl
             const tagBuilding* target = NULL;
             int fewestWorkers = numeric_limits<int>::max();
             for (const tagBuilding& building : info.buildings) {
-                if (!buildingNeedsWorkers(building))
+                if (!buildingShouldReceiveWorkers(info, building))
                     continue;
                 const int assigned = workersPerBuilding[building.SN];
                 if (assigned < fewestWorkers) {
@@ -1087,7 +1259,7 @@ struct UsrAIStrategy::Impl
         if (info.civilizationStage <= CIVILIZATION_STONEAGE)
             return 13;
         if (info.civilizationStage == CIVILIZATION_TOOLAGE)
-            return 14;
+            return 13;
         return 40;
     }
 
@@ -1095,14 +1267,16 @@ struct UsrAIStrategy::Impl
     {
         if (!huntAnchorValid)
             return false;
-        for (const tagBuilding& building : info.buildings) {
-            if (building.Type == BUILDING_STOCK
-                && (!finishedOnly || building.Percent >= 100)
-                && distance2(building.BlockDR, building.BlockUR,
-                             huntAnchorX, huntAnchorY) <= 10 * 10)
-                return true;
-        }
-        return false;
+        return hasStockNearPoint(info, huntAnchorX, huntAnchorY,
+                                 finishedOnly, 10);
+    }
+
+    bool hasStockNearGold(const tagInfo& info, bool finishedOnly) const
+    {
+        if (!goldAnchorValid)
+            return false;
+        return hasStockNearPoint(info, goldAnchorX, goldAnchorY,
+                                 finishedOnly);
     }
 
     bool hasUnfinishedBuilding(const tagInfo& info, int type) const
@@ -1117,9 +1291,15 @@ struct UsrAIStrategy::Impl
     vector<int> desiredBuildings(const tagInfo& info) const
     {
         vector<int> desired;
-        const bool needsHerdStock = huntAnchorValid
+        const bool needsHerdStock = readyForHerdStock(info) && huntAnchorValid
             && !hasStockNearHerd(info, false);
+        const bool needsGoldStock = goldAnchorValid
+            && info.civilizationStage >= CIVILIZATION_BRONZEAGE
+            && info.enemy_armies.empty()
+            && !hasStockNearGold(info, false);
         if (needsHerdStock)
+            desired.push_back(BUILDING_STOCK);
+        else if (needsGoldStock)
             desired.push_back(BUILDING_STOCK);
         const int currentHomes = countBuildings(info, BUILDING_HOME, false);
         const int targetHomes = desiredHomeCount(info);
@@ -1133,12 +1313,12 @@ struct UsrAIStrategy::Impl
         }
         const bool needsHome = currentHomes < targetHomes
             && !homeUnderConstruction
-            && populationHeadroom <= 6.0;
+            && populationHeadroom <= 1.0;
         if (needsHome)
             desired.push_back(BUILDING_HOME);
         if (firstBuilding(info, BUILDING_GRANARY, false) == NULL)
             desired.push_back(BUILDING_GRANARY);
-        if (!needsHerdStock
+        if (!needsHerdStock && !needsGoldStock
             && firstBuilding(info, BUILDING_STOCK, false) == NULL)
             desired.push_back(BUILDING_STOCK);
         if (firstBuilding(info, BUILDING_ARMYCAMP, false) == NULL)
@@ -1293,7 +1473,9 @@ struct UsrAIStrategy::Impl
         const bool reserveBronzeFood = info.civilizationStage == CIVILIZATION_TOOLAGE
             && bronzePrerequisitesReady(info);
         const bool hasPopulation = info.Human_Num + 1.0 <= info.Human_MaxNum;
-        const int foodFloor = info.civilizationStage >= CIVILIZATION_BRONZEAGE ? 100 : 50;
+        const int armyReserve = info.civilizationStage >= CIVILIZATION_BRONZEAGE
+            ? bronzeArmyFoodReserve(info) : 0;
+        const int foodFloor = armyReserve + BUILDING_CENTER_CREATEFARMER_FOOD;
         if (farmers < targetFarmers && hasPopulation && info.Meat >= foodFloor
             && (!reserveBronzeFood || info.Meat >= 850)) {
             ai.BuildingAction(center->SN, BUILDING_CENTER_CREATEFARMER);
@@ -1308,19 +1490,28 @@ struct UsrAIStrategy::Impl
         if (info.GameFrame - lastMilitaryOrderFrame < 12)
             return;
         const tagBuilding* camp = firstBuilding(info, BUILDING_ARMYCAMP, true);
-        const tagBuilding* range = firstBuilding(info, BUILDING_RANGE, true);
         if (info.civilizationStage == CIVILIZATION_TOOLAGE) {
-            // The second bowman is the dedicated deer-finding scout.  The
-            // first bowman and the slinger remain behind the arrow towers.
-            if (countArmy(info, AT_BOWMAN) < 2 && buildingIdle(range)
-                && info.Meat >= 90 && info.Wood >= 40) {
-                ai.BuildingAction(range->SN, BUILDING_RANGE_CREATE_BOWMAN);
+            if (bronzePrerequisitesReady(info) || firstWaveEngaged)
+                return;
+            // Two cheap units are enough: one explores and one shadows the
+            // priest.  Do not keep training bowmen after the range completes;
+            // the previous policy spent the food needed to reach Bronze Age.
+            const int cheapUnits = countArmy(info, AT_CLUBMAN)
+                + countArmy(info, AT_SLINGER) + countArmy(info, AT_BOWMAN);
+            if (cheapUnits < 2 && countArmy(info, AT_SLINGER) < 1
+                && buildingIdle(camp)
+                && info.Meat >= BUILDING_ARMYCAMP_CREATE_SLINGER_FOOD + 50
+                && info.Stone >= BUILDING_ARMYCAMP_CREATE_SLINGER_STONE) {
+                ai.BuildingAction(camp->SN,
+                                  BUILDING_ARMYCAMP_CREATE_SLINGER);
                 lastMilitaryOrderFrame = info.GameFrame;
                 return;
             }
-            if (countArmy(info, AT_SLINGER) < 1 && buildingIdle(camp)
-                && info.Meat >= 90 && info.Stone >= 20) {
-                ai.BuildingAction(camp->SN, BUILDING_ARMYCAMP_CREATE_SLINGER);
+            if (cheapUnits < 2 && countArmy(info, AT_CLUBMAN) < 1
+                && buildingIdle(camp)
+                && info.Meat >= BUILDING_ARMYCAMP_CREATE_CLUBMAN_FOOD + 50) {
+                ai.BuildingAction(camp->SN,
+                                  BUILDING_ARMYCAMP_CREATE_CLUBMAN);
                 lastMilitaryOrderFrame = info.GameFrame;
             }
             return;
@@ -1360,6 +1551,8 @@ struct UsrAIStrategy::Impl
     {
         if (firstWaveCleared)
             return;
+        if (!info.enemy_armies.empty())
+            lastEnemyArmySeenFrame = info.GameFrame;
         const pair<int, int> center = centerBlock(info);
         bool enemyArmyNearBase = false;
         for (const tagArmy& enemy : info.enemy_armies) {
@@ -1371,8 +1564,21 @@ struct UsrAIStrategy::Impl
         }
         if (enemyArmyNearBase)
             firstWaveEngaged = true;
-        else if (firstWaveEngaged && info.enemy_armies.empty())
-            firstWaveCleared = true;
+        else if (firstWaveEngaged && info.enemy_armies.empty()
+                 && info.GameFrame - lastEnemyArmySeenFrame > 100) {
+            bool towerStillFiring = false;
+            for (const tagBuilding& building : info.buildings) {
+                if (building.Type == BUILDING_ARROWTOWER
+                    && building.Percent >= 100
+                    && building.Project != ACT_NULL
+                    && building.Project != -1) {
+                    towerStillFiring = true;
+                    break;
+                }
+            }
+            if (!towerStillFiring)
+                firstWaveCleared = true;
+        }
     }
 
     const tagArmy* nearestEnemyArmy(const tagInfo& info, int x, int y) const
@@ -1405,84 +1611,206 @@ struct UsrAIStrategy::Impl
         const bool baseThreat = nearestThreat(info, center.first,
                                               center.second, 22 * 22) != -1;
         const bool visibleEnemyArmy = !info.enemy_armies.empty();
+        const tagArmy* directAttacker = NULL;
+        int directAttackerDistance = numeric_limits<int>::max();
+        for (const tagArmy& enemy : info.enemy_armies) {
+            if (enemy.WorkObjectSN != priest.SN)
+                continue;
+            const int d = distance2(priest.BlockDR, priest.BlockUR,
+                                    enemy.BlockDR, enemy.BlockUR);
+            if (d < directAttackerDistance) {
+                directAttacker = &enemy;
+                directAttackerDistance = d;
+            }
+        }
         const bool danger = tookDamage || personalThreat || baseThreat
             || visibleEnemyArmy;
-        const bool enteredDanger = danger
-            && priestsInDanger.insert(priest.SN).second;
-        if (!danger)
-            priestsInDanger.erase(priest.SN);
-        const bool enteredDirectThreat = personalThreat
-            && priestsUnderDirectThreat.insert(priest.SN).second;
-        if (!personalThreat)
-            priestsUnderDirectThreat.erase(priest.SN);
 
         // Before the first wave is confirmed dead, the priest remains inside
         // the tower screen.  Afterwards it may only make short local patrols
         // while healthy and while no enemy is visible.
         const bool mayExplore = firstWaveCleared && !injured
             && info.enemy_armies.empty() && info.enemy_farmers.empty();
+        const bool needsRefuge = danger || injured || !mayExplore;
+        if (!needsRefuge) {
+            priestsInDanger.erase(priest.SN);
+            priestsUnderDirectThreat.erase(priest.SN);
+            priestRetreatPlans.erase(priest.SN);
+        }
+        else {
+            priestsInDanger.insert(priest.SN);
+            if (personalThreat || directAttacker != NULL)
+                priestsUnderDirectThreat.insert(priest.SN);
+        }
 
         int& lastOrder = lastUnitOrderFrame[priest.SN];
-        if (danger || injured || !mayExplore) {
-            const tagBuilding* refugeTower = NULL;
-            int nearestTowerDistance = numeric_limits<int>::max();
-            for (const tagBuilding& building : info.buildings) {
-                if (building.Type != BUILDING_ARROWTOWER || building.Percent < 100)
-                    continue;
-                const int d = distance2(priest.BlockDR, priest.BlockUR,
-                                        building.BlockDR, building.BlockUR);
-                if (d < nearestTowerDistance) {
-                    nearestTowerDistance = d;
-                    refugeTower = &building;
+        if (needsRefuge) {
+            PriestRetreatPlan& plan = priestRetreatPlans[priest.SN];
+            if (plan.lastX == -1 || plan.lastY == -1
+                || priest.BlockDR != plan.lastX
+                || priest.BlockUR != plan.lastY) {
+                plan.lastX = priest.BlockDR;
+                plan.lastY = priest.BlockUR;
+                plan.lastProgressFrame = info.GameFrame;
+            }
+            bool towerStillExists = plan.towerSN == -1;
+            if (plan.towerSN != -1) {
+                const tagBuilding* tower = findBuildingBySN(info, plan.towerSN);
+                towerStillExists = tower != NULL
+                    && tower->Type == BUILDING_ARROWTOWER
+                    && tower->Percent >= 100;
+            }
+            const bool targetThreatened = plan.valid
+                && nearestThreat(info, plan.targetX, plan.targetY, 8 * 8) != -1;
+            const bool standingAtRefuge = plan.valid
+                && distance2(priest.BlockDR, priest.BlockUR,
+                             plan.targetX, plan.targetY) <= 4;
+            const bool retreatStalled = plan.valid
+                && info.GameFrame - plan.lastProgressFrame > 50;
+            const bool urgentEscapePlan = (directAttacker != NULL || tookDamage)
+                && (standingAtRefuge || retreatStalled)
+                && (lastOrder == 0 || info.GameFrame - lastOrder > 8);
+            const bool mayChangePlan = !plan.valid || !towerStillExists
+                || urgentEscapePlan
+                || (targetThreatened
+                    && info.GameFrame >= plan.holdUntilFrame
+                    && (standingAtRefuge || retreatStalled));
+
+            if (mayChangePlan) {
+                const pair<int, int> baseRefuge = dispersedBasePoint(info,
+                                                                     priest.SN);
+                int bestX = baseRefuge.first;
+                int bestY = baseRefuge.second;
+                int bestTowerSN = -1;
+                long bestScore = numeric_limits<long>::min();
+
+                // Candidate zero is the town-center refuge.  Every tower adds
+                // a candidate on its base-facing side, so the tower stays
+                // between the priest and the attacking front.
+                vector<pair<pair<int, int>, int> > candidates;
+                candidates.push_back(make_pair(baseRefuge, -1));
+                static const int kiteOffsets[][2] = {
+                    { 7, 0 }, { 5, 5 }, { 0, 7 }, { -5, 5 },
+                    { -7, 0 }, { -5, -5 }, { 0, -7 }, { 5, -5 }
+                };
+                const int kiteCount = int(sizeof(kiteOffsets)
+                                           / sizeof(kiteOffsets[0]));
+                for (int i = 0; i < kiteCount; ++i) {
+                    const int kiteX = max(0, min(MAP_L - 1,
+                        priest.BlockDR + kiteOffsets[i][0]));
+                    const int kiteY = max(0, min(MAP_U - 1,
+                        priest.BlockUR + kiteOffsets[i][1]));
+                    candidates.push_back(make_pair(make_pair(kiteX, kiteY),
+                                                   -1));
                 }
+                for (const tagBuilding& building : info.buildings) {
+                    if (building.Type != BUILDING_ARROWTOWER
+                        || building.Percent < 100)
+                        continue;
+                    const int towerX = building.BlockDR + 1;
+                    const int towerY = building.BlockUR + 1;
+                    const int backX = center.first > towerX ? 1
+                        : (center.first < towerX ? -1 : 0);
+                    const int backY = center.second > towerY ? 1
+                        : (center.second < towerY ? -1 : 0);
+                    int candidateX = towerX + backX * 6;
+                    int candidateY = towerY + backY * 6;
+                    candidateX = max(0, min(MAP_L - 1, candidateX));
+                    candidateY = max(0, min(MAP_U - 1, candidateY));
+                    candidates.push_back(make_pair(
+                        make_pair(candidateX, candidateY), building.SN));
+                    const int sideX = -backY * 4;
+                    const int sideY = backX * 4;
+                    candidates.push_back(make_pair(
+                        make_pair(max(0, min(MAP_L - 1,
+                                             candidateX + sideX)),
+                                  max(0, min(MAP_U - 1,
+                                             candidateY + sideY))),
+                        building.SN));
+                    candidates.push_back(make_pair(
+                        make_pair(max(0, min(MAP_L - 1,
+                                             candidateX - sideX)),
+                                  max(0, min(MAP_U - 1,
+                                             candidateY - sideY))),
+                        building.SN));
+                }
+
+                for (const pair<pair<int, int>, int>& candidate : candidates) {
+                    const int candidateX = candidate.first.first;
+                    const int candidateY = candidate.first.second;
+                    if (!openMovementPoint(info, candidateX, candidateY))
+                        continue;
+                    int enemyClearance = 40 * 40;
+                    for (const tagArmy& enemy : info.enemy_armies) {
+                        enemyClearance = min(enemyClearance,
+                            distance2(candidateX, candidateY,
+                                      enemy.BlockDR, enemy.BlockUR));
+                    }
+                    const long currentPositionPenalty =
+                        (directAttacker != NULL || tookDamage)
+                        && distance2(priest.BlockDR, priest.BlockUR,
+                                     candidateX, candidateY) <= 3 * 3
+                        ? 1000000L : 0L;
+                    const long exposedPenalty = enemyClearance <= 6 * 6
+                        ? 500000L : 0L;
+                    long towerCover = 0L;
+                    int coveringTowerSN = -1;
+                    for (const tagBuilding& tower : info.buildings) {
+                        if (tower.Type != BUILDING_ARROWTOWER
+                            || tower.Percent < 100)
+                            continue;
+                        const int towerDistance = distance2(
+                            candidateX, candidateY,
+                            tower.BlockDR + 1, tower.BlockUR + 1);
+                        if (towerDistance <= 10 * 10
+                            && 16000L - 80L * towerDistance > towerCover) {
+                            towerCover = 16000L - 80L * towerDistance;
+                            coveringTowerSN = tower.SN;
+                        }
+                    }
+                    const long oldTargetPenalty = retreatStalled
+                        && candidateX == plan.targetX
+                        && candidateY == plan.targetY ? 1000000L : 0L;
+                    const long score = towerCover + 40L * enemyClearance
+                        - 80L * distance2(priest.BlockDR, priest.BlockUR,
+                                          candidateX, candidateY)
+                        - currentPositionPenalty - exposedPenalty
+                        - oldTargetPenalty;
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestX = candidateX;
+                        bestY = candidateY;
+                        bestTowerSN = coveringTowerSN != -1
+                            ? coveringTowerSN : candidate.second;
+                    }
+                }
+                plan.targetX = bestX;
+                plan.targetY = bestY;
+                plan.towerSN = bestTowerSN;
+                plan.holdUntilFrame = info.GameFrame + 100;
+                plan.lastX = priest.BlockDR;
+                plan.lastY = priest.BlockUR;
+                plan.lastProgressFrame = info.GameFrame;
+                plan.valid = true;
             }
 
-            int safeX = min(MAP_L - 1, center.first + 4);
-            int safeY = min(MAP_U - 1, center.second + 4);
-            const tagArmy* pursuer = nearestEnemyArmy(info, priest.BlockDR,
-                                                      priest.BlockUR);
-            if (refugeTower != NULL) {
-                const int towerX = refugeTower->BlockDR + 1;
-                const int towerY = refugeTower->BlockUR + 1;
-                const int directionX = pursuer != NULL
-                    ? towerX - pursuer->BlockDR : center.first - towerX;
-                const int directionY = pursuer != NULL
-                    ? towerY - pursuer->BlockUR : center.second - towerY;
-                safeX = towerX
-                    + (directionX > 0 ? 5 : (directionX < 0 ? -5 : 0));
-                safeY = towerY
-                    + (directionY > 0 ? 5 : (directionY < 0 ? -5 : 0));
-            }
-
-            // Once an attacker is close enough to keep its target lock, do not
-            // stop at the first refuge coordinate.  Keeping the escape point
-            // ahead of the priest makes it kite past the tower while it fires.
-            if (pursuer != NULL && (personalThreat || tookDamage)) {
-                int directionX = priest.BlockDR - pursuer->BlockDR;
-                int directionY = priest.BlockUR - pursuer->BlockUR;
-                if (directionX == 0)
-                    directionX = center.first - pursuer->BlockDR;
-                if (directionY == 0)
-                    directionY = center.second - pursuer->BlockUR;
-                safeX = priest.BlockDR + (directionX >= 0 ? 8 : -8);
-                safeY = priest.BlockUR + (directionY >= 0 ? 8 : -8);
-                safeX = max(center.first - 18, min(center.first + 18, safeX));
-                safeY = max(center.second - 18, min(center.second + 18, safeY));
-            }
-            safeX = max(0, min(MAP_L - 1, safeX));
-            safeY = max(0, min(MAP_U - 1, safeY));
-
-            const bool urgentRetreat = tookDamage || enteredDanger
-                || enteredDirectThreat;
-            const int orderCooldown = personalThreat ? 8 : (danger ? 30 : 75);
-            if ((priest.WorkObjectSN != -1
-                 || personalThreat
-                 || distance2(priest.BlockDR, priest.BlockUR, safeX, safeY) > 4)
-                && (urgentRetreat
-                    || info.GameFrame - lastOrder > orderCooldown)) {
+            const int distanceToRefuge = distance2(priest.BlockDR,
+                                                    priest.BlockUR,
+                                                    plan.targetX,
+                                                    plan.targetY);
+            const bool movementInterrupted = priest.NowState == HUMAN_STATE_IDLE
+                || priest.WorkObjectSN != -1;
+            const int commandCooldown = directAttacker != NULL || tookDamage
+                ? 8 : 25;
+            if (distanceToRefuge > 4
+                && (mayChangePlan
+                    || (movementInterrupted
+                        && info.GameFrame - lastOrder > commandCooldown))
+                && (lastOrder == 0
+                    || info.GameFrame - lastOrder > commandCooldown)) {
                 ai.HumanMove(priest.SN,
-                             (safeX + 0.5) * double(BLOCKSIDELENGTH),
-                             (safeY + 0.5) * double(BLOCKSIDELENGTH));
+                             (plan.targetX + 0.5) * double(BLOCKSIDELENGTH),
+                             (plan.targetY + 0.5) * double(BLOCKSIDELENGTH));
                 lastOrder = info.GameFrame;
             }
             return;
@@ -1513,45 +1841,242 @@ struct UsrAIStrategy::Impl
     void selectArmyScout(const tagInfo& info)
     {
         bool currentScoutAlive = false;
+        int currentScoutSort = -1;
         int bowmanCount = 0;
         int newestBowmanSN = -1;
+        int newestClubmanSN = -1;
         int fallbackScoutSN = -1;
         for (const tagArmy& army : info.armies) {
             if (army.SN == armyScoutSN && army.Sort != AT_PRIEST
-                && army.Sort != AT_SHIP)
+                && army.Sort != AT_SHIP) {
                 currentScoutAlive = true;
+                currentScoutSort = army.Sort;
+            }
             if (army.Sort == AT_BOWMAN) {
                 ++bowmanCount;
                 newestBowmanSN = max(newestBowmanSN, army.SN);
             }
-            if (army.Sort == AT_SLINGER || army.Sort == AT_BOWMAN)
+            if (army.Sort == AT_CLUBMAN)
+                newestClubmanSN = max(newestClubmanSN, army.SN);
+            if (army.SN != priestGuardSN
+                && (army.Sort == AT_CLUBMAN || army.Sort == AT_SLINGER
+                    || army.Sort == AT_BOWMAN))
                 fallbackScoutSN = max(fallbackScoutSN, army.SN);
         }
         if (!currentScoutAlive)
             armyScoutSN = -1;
-        if (armyScoutSN == -1 && bowmanCount >= 2) {
+        if (priestGuardSN == -1 && newestClubmanSN != -1
+            && currentScoutAlive && currentScoutSort != AT_CLUBMAN) {
+            // Once the second cheap unit exists, let the clubman take the
+            // exploration risk and retain the ranged unit as priest guard.
+            armyScoutSN = newestClubmanSN;
+            armyScoutWaypoint = 0;
+            armyScoutLastX = -1;
+            armyScoutLastY = -1;
+            armyScoutLastProgressFrame = info.GameFrame;
+        }
+        else if (armyScoutSN == -1 && bowmanCount >= 2) {
             armyScoutSN = newestBowmanSN;
             armyScoutWaypoint = 0;
+            armyScoutLastX = -1;
+            armyScoutLastY = -1;
+            armyScoutLastProgressFrame = info.GameFrame;
         }
-        else if (armyScoutSN == -1 && firstWaveCleared
-                 && fallbackScoutSN != -1) {
-            // The latest log did not start scouting until the second bowman
-            // appeared.  After wave one, the existing tool-age ranged unit is
-            // safe to use immediately instead of waiting several more minutes.
+        else if (armyScoutSN == -1 && fallbackScoutSN != -1
+                 && !firstWaveEngaged) {
+            // The first cheap unit scouts while the towers hold the opening.
+            // A nearby uncontained enemy switches it to retreat, so exploration
+            // no longer waits until the first wave is over.
             armyScoutSN = fallbackScoutSN;
             armyScoutWaypoint = 0;
+            armyScoutLastX = -1;
+            armyScoutLastY = -1;
+            armyScoutLastProgressFrame = info.GameFrame;
+        }
+    }
+
+    void selectPriestGuard(const tagInfo& info)
+    {
+        bool currentGuardAlive = false;
+        for (const tagArmy& army : info.armies) {
+            if (army.SN == priestGuardSN && army.SN != armyScoutSN
+                && (army.Sort == AT_SLINGER || army.Sort == AT_BOWMAN
+                    || army.Sort == AT_CLUBMAN
+                    || army.Sort == AT_BROADSWORDSMAN)) {
+                currentGuardAlive = true;
+                break;
+            }
+        }
+        if (currentGuardAlive)
+            return;
+
+        priestGuardSN = -1;
+        int bestRank = numeric_limits<int>::max();
+        for (const tagArmy& army : info.armies) {
+            if (army.SN == armyScoutSN)
+                continue;
+            int rank = numeric_limits<int>::max();
+            if (army.Sort == AT_SLINGER)
+                rank = 0;
+            else if (army.Sort == AT_BOWMAN)
+                rank = 1;
+            else if (army.Sort == AT_CLUBMAN)
+                rank = 2;
+            else if (army.Sort == AT_BROADSWORDSMAN)
+                rank = 3;
+            if (rank < bestRank) {
+                bestRank = rank;
+                priestGuardSN = army.SN;
+            }
+        }
+    }
+
+    bool managePriestRescue(UsrAI& ai, const tagInfo& info,
+                            const tagArmy& rescuer,
+                            const tagArmy* attacker)
+    {
+        if (attacker == NULL)
+            return false;
+        int& lastOrder = lastUnitOrderFrame[rescuer.SN];
+        if (rescuer.WorkObjectSN != attacker->SN
+            && info.GameFrame - lastOrder > 6) {
+            // Saving the priest preempts scouting and ordinary defense.  All
+            // available combat units converge and hit the unit holding aggro.
+            // Once it switches targets, the normal defense code resumes and
+            // ranged units may kite it back through tower fire.
+            ai.HumanAction(rescuer.SN, attacker->SN);
+            lastOrder = info.GameFrame;
+        }
+        return true;
+    }
+
+    void managePriestGuard(UsrAI& ai, const tagInfo& info,
+                           const tagArmy& guard, const tagArmy* priest,
+                           const pair<int, int>& center,
+                           int centerSideX, int centerSideY)
+    {
+        const tagArmy* attacker = NULL;
+        int attackerDistance = numeric_limits<int>::max();
+        if (priest != NULL) {
+            for (const tagArmy& enemy : info.enemy_armies) {
+                if (enemy.WorkObjectSN != priest->SN)
+                    continue;
+                const int d = distance2(guard.BlockDR, guard.BlockUR,
+                                        enemy.BlockDR, enemy.BlockUR);
+                if (d < attackerDistance) {
+                    attackerDistance = d;
+                    attacker = &enemy;
+                }
+            }
+        }
+        if (attacker == NULL) {
+            // The guard also subscribes to the local defense zone.  It may
+            // help the towers, but it never chases a target outside their
+            // coverage.
+            for (const tagArmy& enemy : info.enemy_armies) {
+                bool towerCovered = false;
+                for (const tagBuilding& tower : info.buildings) {
+                    if (tower.Type == BUILDING_ARROWTOWER
+                        && tower.Percent >= 100
+                        && distance2(tower.BlockDR, tower.BlockUR,
+                                     enemy.BlockDR, enemy.BlockUR) <= 9 * 9) {
+                        towerCovered = true;
+                        break;
+                    }
+                }
+                if (!towerCovered)
+                    continue;
+                const int d = distance2(guard.BlockDR, guard.BlockUR,
+                                        enemy.BlockDR, enemy.BlockUR);
+                if (d < attackerDistance) {
+                    attackerDistance = d;
+                    attacker = &enemy;
+                }
+            }
+        }
+
+        int& lastOrder = lastUnitOrderFrame[guard.SN];
+        if (attacker != NULL) {
+            const bool rangedGuard = guard.Sort == AT_SLINGER
+                || guard.Sort == AT_BOWMAN;
+            if (rangedGuard && attackerDistance <= 5 * 5) {
+                int awayX = guard.BlockDR
+                    + (guard.BlockDR >= attacker->BlockDR ? 6 : -6);
+                int awayY = guard.BlockUR
+                    + (guard.BlockUR >= attacker->BlockUR ? 6 : -6);
+                awayX += center.first > guard.BlockDR ? 2 : -2;
+                awayY += center.second > guard.BlockUR ? 2 : -2;
+                awayX = max(0, min(MAP_L - 1, awayX));
+                awayY = max(0, min(MAP_U - 1, awayY));
+                if (!openMovementPoint(info, awayX, awayY)) {
+                    awayX = centerSideX;
+                    awayY = centerSideY;
+                }
+                if (info.GameFrame - lastOrder > 8) {
+                    ai.HumanMove(guard.SN,
+                                 (awayX + 0.5) * double(BLOCKSIDELENGTH),
+                                 (awayY + 0.5) * double(BLOCKSIDELENGTH));
+                    lastOrder = info.GameFrame;
+                }
+            }
+            else if (guard.WorkObjectSN != attacker->SN
+                     && info.GameFrame - lastOrder > 8) {
+                ai.HumanAction(guard.SN, attacker->SN);
+                lastOrder = info.GameFrame;
+            }
+            return;
+        }
+
+        int followX = centerSideX;
+        int followY = centerSideY;
+        if (priest != NULL) {
+            followX = priest->BlockDR
+                + (center.first > priest->BlockDR ? 2 : -2);
+            followY = priest->BlockUR
+                + (center.second > priest->BlockUR ? 2 : -2);
+            followX = max(0, min(MAP_L - 1, followX));
+            followY = max(0, min(MAP_U - 1, followY));
+        }
+        if ((guard.WorkObjectSN != -1
+             || (guard.NowState == HUMAN_STATE_IDLE
+                 && distance2(guard.BlockDR, guard.BlockUR,
+                              followX, followY) > 9))
+            && info.GameFrame - lastOrder > 75) {
+            ai.HumanMove(guard.SN,
+                         (followX + 0.5) * double(BLOCKSIDELENGTH),
+                         (followY + 0.5) * double(BLOCKSIDELENGTH));
+            lastOrder = info.GameFrame;
         }
     }
 
     bool manageArmyScout(UsrAI& ai, const tagInfo& info, const tagArmy& scout,
                          const pair<int, int>& center)
     {
-        if (scout.SN != armyScoutSN || (huntAnchorValid && goldAnchorValid))
+        if (scout.SN != armyScoutSN)
+            return false;
+        if (huntAnchorValid && goldAnchorValid)
             return false;
 
-        const bool danger = !info.enemy_armies.empty()
-            || nearestThreat(info, scout.BlockDR, scout.BlockUR, 16 * 16) != -1
-            || (firstWaveEngaged && !firstWaveCleared);
+        if (armyScoutLastX == -1 || armyScoutLastY == -1
+            || scout.BlockDR != armyScoutLastX
+            || scout.BlockUR != armyScoutLastY) {
+            armyScoutLastX = scout.BlockDR;
+            armyScoutLastY = scout.BlockUR;
+            armyScoutLastProgressFrame = info.GameFrame;
+        }
+
+        bool uncontainedEnemy = false;
+        for (const tagArmy& enemy : info.enemy_armies) {
+            const tagBuilding* attacked = findBuildingBySN(info,
+                                                            enemy.WorkObjectSN);
+            if (attacked == NULL || attacked->Type != BUILDING_ARROWTOWER) {
+                uncontainedEnemy = true;
+                break;
+            }
+        }
+        const bool danger = nearestThreat(info, scout.BlockDR,
+                                           scout.BlockUR, 10 * 10) != -1
+            || (firstWaveEngaged && !firstWaveCleared && uncontainedEnemy);
         int& lastOrder = lastUnitOrderFrame[scout.SN];
         if (danger) {
             const tagBuilding* refuge = NULL;
@@ -1612,10 +2137,10 @@ struct UsrAIStrategy::Impl
 
         const bool arrived = distance2(scout.BlockDR, scout.BlockUR,
                                        targetX, targetY) <= 9;
-        const bool stalled = scout.NowState == HUMAN_STATE_IDLE
-            && info.GameFrame - lastOrder > 120;
+        const bool stalled = info.GameFrame - armyScoutLastProgressFrame > 90;
         if (arrived || stalled) {
             armyScoutWaypoint = (armyScoutWaypoint + 1) % waypointCount;
+            armyScoutLastProgressFrame = info.GameFrame;
             targetX = center.first
                 + directionX * waypointOffsets[armyScoutWaypoint][0];
             targetY = center.second
@@ -1623,7 +2148,7 @@ struct UsrAIStrategy::Impl
             targetX = max(0, min(MAP_L - 1, targetX));
             targetY = max(0, min(MAP_U - 1, targetY));
         }
-        if (arrived || stalled || info.GameFrame - lastOrder > 120) {
+        if (arrived || stalled || info.GameFrame - lastOrder > 75) {
             ai.HumanMove(scout.SN,
                          (targetX + 0.5) * double(BLOCKSIDELENGTH),
                          (targetY + 0.5) * double(BLOCKSIDELENGTH));
@@ -1636,9 +2161,29 @@ struct UsrAIStrategy::Impl
     {
         selectArmyScout(info);
         set<int> priestSNs;
+        const tagArmy* protectedPriest = NULL;
         for (const tagArmy& army : info.armies) {
-            if (army.Sort == AT_PRIEST)
+            if (army.Sort == AT_PRIEST) {
                 priestSNs.insert(army.SN);
+                if (protectedPriest == NULL)
+                    protectedPriest = &army;
+            }
+        }
+        selectPriestGuard(info);
+        const tagArmy* directPriestAttacker = NULL;
+        int directAttackerDistance = numeric_limits<int>::max();
+        if (protectedPriest != NULL) {
+            for (const tagArmy& enemy : info.enemy_armies) {
+                if (enemy.WorkObjectSN != protectedPriest->SN)
+                    continue;
+                const int d = distance2(protectedPriest->BlockDR,
+                                        protectedPriest->BlockUR,
+                                        enemy.BlockDR, enemy.BlockUR);
+                if (d < directAttackerDistance) {
+                    directAttackerDistance = d;
+                    directPriestAttacker = &enemy;
+                }
+            }
         }
         set<int> claimedTowerTargets;
         for (const tagBuilding& building : info.buildings) {
@@ -1703,11 +2248,55 @@ struct UsrAIStrategy::Impl
                 movePriestSafely(ai, info, army, center);
                 continue;
             }
+            if (managePriestRescue(ai, info, army,
+                                   directPriestAttacker))
+                continue;
+            if (army.SN == priestGuardSN) {
+                managePriestGuard(ai, info, army, protectedPriest, center,
+                                  centerSideX, centerSideY);
+                continue;
+            }
             if (manageArmyScout(ai, info, army, center))
                 continue;
             if (!firstWaveCleared) {
+                int coveredTowerTarget = -1;
+                int coveredTargetDistance = numeric_limits<int>::max();
+                const bool toolAgeDefender = army.Sort == AT_SLINGER
+                    || army.Sort == AT_BOWMAN || army.Sort == AT_CLUBMAN;
+                if (toolAgeDefender) {
+                    for (const tagArmy& enemy : info.enemy_armies) {
+                        bool insideDefenseZone = false;
+                        for (const tagBuilding& tower : info.buildings) {
+                            if (tower.Type == BUILDING_ARROWTOWER
+                                && tower.Percent >= 100
+                                && distance2(tower.BlockDR, tower.BlockUR,
+                                             enemy.BlockDR, enemy.BlockUR)
+                                    <= 9 * 9) {
+                                insideDefenseZone = true;
+                                break;
+                            }
+                        }
+                        if (!insideDefenseZone)
+                            continue;
+                        const int d = distance2(army.BlockDR, army.BlockUR,
+                                                enemy.BlockDR, enemy.BlockUR);
+                        if (d < coveredTargetDistance) {
+                            coveredTargetDistance = d;
+                            coveredTowerTarget = enemy.SN;
+                        }
+                    }
+                }
                 const bool enemyIsClose = nearestThreat(info, army.BlockDR,
                                                         army.BlockUR, 5 * 5) != -1;
+                if (coveredTowerTarget != -1 && !enemyIsClose) {
+                    if (army.WorkObjectSN != coveredTowerTarget
+                        && info.GameFrame
+                            - lastUnitOrderFrame[army.SN] > 12) {
+                        ai.HumanAction(army.SN, coveredTowerTarget);
+                        lastUnitOrderFrame[army.SN] = info.GameFrame;
+                    }
+                    continue;
+                }
                 int targetX = centerSideX;
                 int targetY = centerSideY;
                 if (enemyIsClose && forwardTower != NULL) {
@@ -1731,6 +2320,81 @@ struct UsrAIStrategy::Impl
                 }
                 continue;
             }
+
+            const bool toolAgeDefender = army.Sort == AT_SLINGER
+                || army.Sort == AT_BOWMAN || army.Sort == AT_CLUBMAN;
+            if (toolAgeDefender) {
+                int towerTarget = -1;
+                int towerTargetDistance = 14 * 14 + 1;
+                for (const tagArmy& enemy : info.enemy_armies) {
+                    bool insideDefenseZone = false;
+                    for (const tagBuilding& tower : info.buildings) {
+                        if (tower.Type == BUILDING_ARROWTOWER
+                            && tower.Percent >= 100
+                            && distance2(tower.BlockDR, tower.BlockUR,
+                                         enemy.BlockDR, enemy.BlockUR)
+                                <= 9 * 9) {
+                            insideDefenseZone = true;
+                            break;
+                        }
+                    }
+                    if (!insideDefenseZone)
+                        continue;
+                    const int d = distance2(army.BlockDR, army.BlockUR,
+                                            enemy.BlockDR, enemy.BlockUR);
+                    if (d < towerTargetDistance) {
+                        towerTargetDistance = d;
+                        towerTarget = enemy.SN;
+                    }
+                }
+
+                const bool personallyThreatened = nearestThreat(
+                    info, army.BlockDR, army.BlockUR, 5 * 5) != -1;
+                if (personallyThreatened) {
+                    if (info.GameFrame - lastUnitOrderFrame[army.SN] > 20) {
+                        ai.HumanMove(army.SN,
+                                     (centerSideX + 0.5)
+                                         * double(BLOCKSIDELENGTH),
+                                     (centerSideY + 0.5)
+                                         * double(BLOCKSIDELENGTH));
+                        lastUnitOrderFrame[army.SN] = info.GameFrame;
+                    }
+                }
+                else if (towerTarget != -1
+                         && army.WorkObjectSN != towerTarget) {
+                    if (info.GameFrame
+                            - lastUnitOrderFrame[army.SN] > 12) {
+                        ai.HumanAction(army.SN, towerTarget);
+                        lastUnitOrderFrame[army.SN] = info.GameFrame;
+                    }
+                }
+                else if (towerTarget == -1 && army.WorkObjectSN != -1) {
+                    if (info.GameFrame
+                            - lastUnitOrderFrame[army.SN] > 20) {
+                        ai.HumanMove(army.SN,
+                                     (centerSideX + 0.5)
+                                         * double(BLOCKSIDELENGTH),
+                                     (centerSideY + 0.5)
+                                         * double(BLOCKSIDELENGTH));
+                        lastUnitOrderFrame[army.SN] = info.GameFrame;
+                    }
+                }
+                else if (army.WorkObjectSN == -1
+                         && army.NowState == HUMAN_STATE_IDLE
+                         && distance2(army.BlockDR, army.BlockUR,
+                                      centerSideX, centerSideY) > 4
+                         && info.GameFrame
+                                - lastUnitOrderFrame[army.SN] > 120) {
+                    ai.HumanMove(army.SN,
+                                 (centerSideX + 0.5)
+                                     * double(BLOCKSIDELENGTH),
+                                 (centerSideY + 0.5)
+                                     * double(BLOCKSIDELENGTH));
+                    lastUnitOrderFrame[army.SN] = info.GameFrame;
+                }
+                continue;
+            }
+
             const int target = nearestThreat(info, army.BlockDR, army.BlockUR, 12 * 12);
             if (target != -1 && army.WorkObjectSN == -1) {
                 ai.HumanAction(army.SN, target);
@@ -1977,8 +2641,9 @@ struct UsrAIStrategy::Impl
             return;
 
         map<int, int> gathererCounts;
-        // A stale WorkObjectSN left by the killing blow is not sufficient:
-        // only a non-idle villager is considered to be actively gathering.
+        // Keep an acknowledged carcass assignment through brief idle state
+        // transitions.  The lease timeout, rather than a single snapshot,
+        // decides whether that worker really needs the order repeated.
         for (const tagFarmer& farmer : info.farmers) {
             if (farmer.FarmerSort != FARMERTYPE_FARMER
                 || (formerBerryWorkers.count(farmer.SN) == 0
@@ -1989,7 +2654,8 @@ struct UsrAIStrategy::Impl
                 && work->Blood <= 0 && work->Cnt > 0
                 && herdGazelles.count(work->SN) != 0
                 && !workerLeaseBlocked(farmer.SN, work->SN)
-                && farmer.NowState != HUMAN_STATE_IDLE) {
+                && !(farmer.NowState == HUMAN_STATE_IDLE
+                     && farmer.Resource > 0)) {
                 ++gathererCounts[work->SN];
                 publishWorkerAction(farmer.SN, work->SN,
                                     WORKER_TASK_GATHER, 750, TOPIC_HUNT);
@@ -2219,7 +2885,9 @@ struct UsrAIStrategy::Impl
             ? 4 : 3;
         targets[ROLE_STONE] = 2;
         targets[ROLE_GOLD] = info.civilizationStage >= CIVILIZATION_BRONZEAGE
-            ? 4 : (info.civilizationStage >= CIVILIZATION_TOOLAGE ? 2 : 0);
+            ? 4 : (info.civilizationStage >= CIVILIZATION_TOOLAGE
+                   && bronzePrerequisitesReady(info) && info.Gold < 50
+                       ? 2 : 0);
     }
 
     ResourceRole chooseRole(const tagInfo& info, const int counts[4],
@@ -2270,6 +2938,16 @@ struct UsrAIStrategy::Impl
         int roleTargets[4];
         fillRoleTargets(info, static_cast<int>(berries.size()), roleTargets);
         int roleCounts[4] = { 0, 0, 0, 0 };
+        if (!goldAnchorValid || roleTargets[ROLE_GOLD] == 0
+            || info.Gold >= 95)
+            goldTransferWorkers.clear();
+        for (const tagFarmer& farmer : info.farmers) {
+            const tagResource* current = findResourceBySN(info,
+                                                           farmer.WorkObjectSN);
+            if (current != NULL && current->Type == RESOURCE_GOLD)
+                goldTransferWorkers.erase(farmer.SN);
+        }
+        set<int> goldReassignWorkers = goldTransferWorkers;
 
         // Delivery is a separate high-priority task.  It prevents an idle
         // carrier from being mistaken for an active gatherer merely because
@@ -2290,10 +2968,85 @@ struct UsrAIStrategy::Impl
             commanded.insert(farmer.SN);
         }
 
+        // Existing assignments used to remain sticky forever, so discovering
+        // gold only affected newly trained villagers.  Reserve visible gold
+        // nodes now and proactively transfer workers from surplus stone first,
+        // then surplus wood.  Carried material is deposited before the move.
+        if (goldAnchorValid && info.civilizationStage >= CIVILIZATION_TOOLAGE
+            && info.Gold < 95) {
+            set<int> occupiedGoldNodes;
+            int visibleGoldNodes = 0;
+            for (const tagResource& resource : info.resources) {
+                if (resource.Type == RESOURCE_GOLD && resource.Cnt > 0)
+                    ++visibleGoldNodes;
+            }
+            for (const tagFarmer& farmer : info.farmers) {
+                if (farmer.FarmerSort != FARMERTYPE_FARMER
+                    || commanded.count(farmer.SN) != 0)
+                    continue;
+                const tagResource* target = findResourceBySN(info,
+                                                             farmer.WorkObjectSN);
+                if (target != NULL && target->Type == RESOURCE_GOLD
+                    && target->Cnt > 0)
+                    occupiedGoldNodes.insert(target->SN);
+            }
+
+            const int committedGoldWorkers = int(occupiedGoldNodes.size())
+                + int(goldTransferWorkers.size());
+            int needed = min(roleTargets[ROLE_GOLD] - committedGoldWorkers,
+                             visibleGoldNodes - committedGoldWorkers);
+            vector<pair<long, int> > candidates;
+            if (needed > 0) {
+                for (const tagFarmer& farmer : info.farmers) {
+                    if (farmer.FarmerSort != FARMERTYPE_FARMER
+                        || commanded.count(farmer.SN) != 0
+                        || goldTransferWorkers.count(farmer.SN) != 0
+                        || workerIsConstructing(info, farmer))
+                        continue;
+                    const tagResource* target = findResourceBySN(
+                        info, farmer.WorkObjectSN);
+                    if (target == NULL || target->Cnt <= 0)
+                        continue;
+                    const ResourceRole role = resourceRole(*target);
+                    long priority = numeric_limits<long>::max();
+                    if (role == ROLE_STONE && info.Stone >= 200)
+                        priority = 0;
+                    else if (role == ROLE_WOOD && info.Wood >= 250)
+                        priority = 1000000L;
+                    if (priority == numeric_limits<long>::max())
+                        continue;
+                    priority += distance2(farmer.BlockDR, farmer.BlockUR,
+                                          goldAnchorX, goldAnchorY);
+                    candidates.push_back(make_pair(priority, farmer.SN));
+                }
+                sort(candidates.begin(), candidates.end());
+                for (size_t i = 0; i < candidates.size() && needed > 0;
+                     ++i, --needed) {
+                    goldReassignWorkers.insert(candidates[i].second);
+                    goldTransferWorkers.insert(candidates[i].second);
+                }
+            }
+        }
+
         for (const tagFarmer& farmer : info.farmers) {
             if (farmer.FarmerSort != FARMERTYPE_FARMER
                 || commanded.count(farmer.SN) != 0)
                 continue;
+            if (goldReassignWorkers.count(farmer.SN) != 0) {
+                if (farmer.Resource > 0) {
+                    const tagBuilding* dropoff =
+                        nearestCarriedResourceDropoff(info, farmer);
+                    if (dropoff != NULL) {
+                        publishWorkerAction(farmer.SN, dropoff->SN,
+                                            WORKER_TASK_DEPOSIT, 700,
+                                            TOPIC_ECONOMY);
+                        commanded.insert(farmer.SN);
+                        continue;
+                    }
+                }
+                reassignToPreferredDropoff.insert(farmer.SN);
+                continue;
+            }
             const tagResource* target = findResourceBySN(info, farmer.WorkObjectSN);
             if (target != NULL && target->Cnt > 0) {
                 if (workerLeaseBlocked(farmer.SN, target->SN)) {
@@ -2359,8 +3112,13 @@ struct UsrAIStrategy::Impl
         while (!idle.empty()) {
             const tagFarmer* worker = idle.back();
             idle.pop_back();
-            ResourceRole preferred = chooseRole(info, roleCounts,
-                                                static_cast<int>(berries.size()));
+            const bool urgentGold = goldAnchorValid && info.Gold < 95
+                && roleCounts[ROLE_GOLD] < roleTargets[ROLE_GOLD];
+            ResourceRole preferred = (urgentGold
+                                      || goldReassignWorkers.count(worker->SN) != 0)
+                ? ROLE_GOLD
+                : chooseRole(info, roleCounts,
+                             static_cast<int>(berries.size()));
             const tagResource* target = NULL;
             for (int attempt = 0; attempt < 4 && target == NULL; ++attempt) {
                 const ResourceRole role = static_cast<ResourceRole>((preferred + attempt) % 4);
@@ -2372,10 +3130,11 @@ struct UsrAIStrategy::Impl
             }
             if (target == NULL) {
                 if (reassignToPreferredDropoff.count(worker->SN) != 0) {
-                    const pair<int, int> center = centerBlock(info);
+                    const pair<int, int> rally = dispersedBasePoint(info,
+                                                                    worker->SN);
                     if (distance2(worker->BlockDR, worker->BlockUR,
-                                  center.first, center.second) > 4)
-                        publishWorkerMove(worker->SN, center.first, center.second,
+                                  rally.first, rally.second) > 4)
+                        publishWorkerMove(worker->SN, rally.first, rally.second,
                                           100, TOPIC_ECONOMY);
                 }
                 continue;
@@ -2393,10 +3152,28 @@ struct UsrAIStrategy::Impl
             return;
         lastTelemetryFrame = info.GameFrame;
         int blockedWorkerTasks = 0;
+        int activeGoldWorkers = 0;
+        int activeHerdWorkers = 0;
+        const tagArmy* priestStatus = NULL;
         for (map<int, WorkerLease>::const_iterator it = workerLeases.begin();
              it != workerLeases.end(); ++it) {
             if (it->second.state == 3)
                 ++blockedWorkerTasks;
+        }
+        for (const tagFarmer& farmer : info.farmers) {
+            const tagResource* target = findResourceBySN(info,
+                                                         farmer.WorkObjectSN);
+            if (target != NULL && target->Type == RESOURCE_GOLD)
+                ++activeGoldWorkers;
+            if (target != NULL && target->Type == RESOURCE_GAZELLE
+                && target->Blood <= 0)
+                ++activeHerdWorkers;
+        }
+        for (const tagArmy& army : info.armies) {
+            if (army.Sort == AT_PRIEST) {
+                priestStatus = &army;
+                break;
+            }
         }
         ostringstream text;
         text << "strategy frame=" << info.GameFrame
@@ -2415,7 +3192,25 @@ struct UsrAIStrategy::Impl
              << " hunt=" << (huntFinished ? "finished"
                  : (huntAnchorValid ? "active" : "searching"))
              << " scout=" << armyScoutSN
-             << " gold=" << (goldAnchorValid ? "found" : "searching")
+             << "/wp=" << armyScoutWaypoint
+             << " guard=" << priestGuardSN;
+        if (priestStatus != NULL) {
+            text << " priest=" << priestStatus->SN << '@'
+                 << priestStatus->BlockDR << ',' << priestStatus->BlockUR
+                 << ':' << priestStatus->Blood << '/'
+                 << priestStatus->MaxBlood
+                 << ":state=" << priestStatus->NowState
+                 << ":work=" << priestStatus->WorkObjectSN;
+            map<int, PriestRetreatPlan>::const_iterator plan =
+                priestRetreatPlans.find(priestStatus->SN);
+            if (plan != priestRetreatPlans.end() && plan->second.valid)
+                text << ":refuge=" << plan->second.targetX << ','
+                     << plan->second.targetY;
+        }
+        text << " gold=" << (goldAnchorValid ? "found" : "searching")
+             << '/' << activeGoldWorkers
+             << "/pending=" << goldTransferWorkers.size()
+             << " carcassWorkers=" << activeHerdWorkers
              << " tech=" << broadswordResearch.state << '/'
              << towerUpgrade.state << '/' << goldMiningResearch.state << '/'
              << woodcuttingResearch.state << '/' << farmingResearch.state
