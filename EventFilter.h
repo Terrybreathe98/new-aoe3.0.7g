@@ -2,6 +2,7 @@
 #define EVENTFILTER_H
 #include<QWidget>
 #include<QEvent>
+#include<QSet>
 #include<iostream>
 #include<list>
 #include<functional>
@@ -62,6 +63,7 @@ private:
     int mouseX;
     int mouseY;
     int wheelScroll;
+    QSet<int> pressedKeys;
     void ResetState();
     void UpdateObject();
     void UpdateReciverFun();
@@ -96,6 +98,7 @@ public:
     void RemoveObject(EventFilterBase*obj);
     int MouseX();
     int MouseY();
+    bool IsKeyPressed(int key) const;
 protected:
     bool eventFilter(QObject *obj, QEvent *event) override;
 };

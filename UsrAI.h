@@ -33,4 +33,22 @@ private:
     /*##########DO NOT MODIFY THE CODE IN THE CLASS##########*/
 };
 
+// Strategy declarations live in this header; their implementation is kept in
+// UsrAI.cpp so the engine-facing UsrAI class above remains untouched.
+class UsrAIStrategy
+{
+public:
+    UsrAIStrategy();
+    ~UsrAIStrategy();
+
+    void process(UsrAI& ai, const tagInfo& info);
+
+private:
+    struct Impl;
+    Impl* impl;
+
+    UsrAIStrategy(const UsrAIStrategy&);
+    UsrAIStrategy& operator=(const UsrAIStrategy&);
+};
+
 #endif

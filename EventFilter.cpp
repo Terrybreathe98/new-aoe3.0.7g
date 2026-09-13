@@ -1,5 +1,6 @@
 #include "EventFilter.h"
 #include"QMouseEvent"
+#include<QKeyEvent>
 #include<QDateTime>
 #include<functional>
 #include<iostream>
@@ -237,6 +238,28 @@ void EventFilter::SetWheelUp()
 
 void EventFilter::EventProcess(QObject *obj, QEvent *event)
 {
+    // 键盘状态需要跨事件保留，供游戏帧持续查询。全局事件过滤器可以保证
+    // 即使焦点暂时落在操作按钮上，WASD 仍然能够控制地图视角。
+    if (event->type() == QEvent::KeyPress) {
+        QKeyEvent* e = static_cast<QKeyEvent*>(event);
+        QWidget* widget = qobject_cast<QWidget*>(obj);
+        if (widget != nullptr &&
+            strcmp(widget->window()->metaObject()->className(), "MainWidget") == 0) {
+            pressedKeys.insert(e->key());
+        }
+        return;
+    }
+    if (event->type() == QEvent::KeyRelease) {
+        QKeyEvent* e = static_cast<QKeyEvent*>(event);
+        if (!e->isAutoRepeat()) pressedKeys.remove(e->key());
+        return;
+    }
+    if (event->type() == QEvent::ApplicationDeactivate ||
+        event->type() == QEvent::WindowDeactivate) {
+        pressedKeys.clear();
+        return;
+    }
+
     //只处理GameWidget传来的事件
     if(strcmp(obj->metaObject()->className(),"GameWidget"))return;
     //更新鼠标位置
@@ -409,6 +432,11 @@ int EventFilter::MouseX()
 int EventFilter::MouseY()
 {
     return mouseY;
+}
+
+bool EventFilter::IsKeyPressed(int key) const
+{
+    return pressedKeys.contains(key);
 }
 
 

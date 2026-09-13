@@ -635,61 +635,28 @@ void GameWidget::AddLine(Double dr0, Double ur0, Double dr1, Double ur1,QColor c
 //地图移动
 void GameWidget::movemap()
 {
-    //此处采用相对坐标，只相对于当前窗口 所以在纵向数据判断处 应该加上的是下窗口的大小
-    int x=this->mapFromGlobal(QCursor().pos()).x();
-    int y=this->mapFromGlobal(QCursor().pos()).y();
-    if(BlockDR+22<0)
-    {
-        BlockDR++;
+    // 屏幕方向到等距地图坐标的换算：W/S 控制纵向，A/D 控制横向。
+    // 同时按两个方向时将步长归一化，避免斜向移动比单方向快一倍。
+    int screenX = 0;
+    int screenY = 0;
+    if (::eventFilter->IsKeyPressed(Qt::Key_A)) --screenX;
+    if (::eventFilter->IsKeyPressed(Qt::Key_D)) ++screenX;
+    if (::eventFilter->IsKeyPressed(Qt::Key_W)) --screenY;
+    if (::eventFilter->IsKeyPressed(Qt::Key_S)) ++screenY;
+
+    int deltaDR = screenX + screenY;
+    int deltaUR = screenX - screenY;
+    if (screenX != 0 && screenY != 0) {
+        deltaDR /= 2;
+        deltaUR /= 2;
     }
-    if(BlockUR<0)
-    {
-        BlockUR++;
-    }
-    if(BlockDR+GAMEWIDGET_MIDBLOCKL>MAP_L-1)
-    {
-        BlockDR--;
-    }
-    if(BlockUR+GAMEWIDGET_MIDBLOCKU>MAP_U-1)
-    {
-        BlockUR--;
-    }
-    if(x<2)
-    {
-        BlockDR--;
-        BlockUR--;
-    }
-    if(x>GAME_WIDTH-20)
-    {
-        BlockDR++;
-        BlockUR++;
-    }
-    if(y<-44)
-    {
-        BlockUR++;
-        BlockDR--;
-    }
-    if(y>GAME_HEIGHT-50-45)//此处先用常数 其中45代表上边框的宽
-    {
-        BlockUR--;
-        BlockDR++;
-    }
-    if(x<2&&y<-44)
-    {
-        BlockDR++;
-    }
-    if(x<-44&&y>GAME_HEIGHT-50-45)
-    {
-        BlockUR++;
-    }
-    if(x>GAME_WIDTH-20&&y<-44)
-    {
-        BlockUR--;
-    }
-    if(x>GAME_WIDTH-20&&y>GAME_HEIGHT-50-45)
-    {
-        BlockDR--;
-    }
+
+    BlockDR = qBound(-GAMEWIDGET_MIDBLOCKL,
+                     BlockDR + deltaDR,
+                     MAP_L - 1 - GAMEWIDGET_MIDBLOCKL);
+    BlockUR = qBound(0,
+                     BlockUR + deltaUR,
+                     MAP_U - 1 - GAMEWIDGET_MIDBLOCKU);
     DR=(BlockDR+Double("0.5"))*16*gen5;
     UR=(BlockUR+Double("0.5"))*16*gen5;
 }

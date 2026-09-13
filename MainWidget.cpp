@@ -1648,7 +1648,8 @@ void MainWidget::paintEvent(QPaintEvent*)
 
 void MainWidget::closeEvent(QCloseEvent *event)
 {
-    GameOverBroadCast.broadcast();
+    // 正常结算时 HandleGameOver 已经广播过；手动关窗仍需通知录像等模块收尾。
+    if (!gameOverHandled) GameOverBroadCast.broadcast();
     QWidget::closeEvent(event);
 }
 
@@ -2379,7 +2380,7 @@ void MainWidget::judgeVictory()
         //弹出胜利提示
         if (IsExamining || QMessageBox::information(this, QStringLiteral("游戏失败"), "很遗憾你没能成功保护部落。智慧之神为你惋惜~", QMessageBox::Ok))
         {
-            HandleGameOver();
+            HandleGameOver(false);
             this->close();
         }
     }
@@ -2395,7 +2396,7 @@ void MainWidget::judgeVictory()
         //弹出胜利提示
         if (IsExamining || QMessageBox::information(this, QStringLiteral("游戏胜利"), "恭喜获胜，获得了纳西妲的青睐！", QMessageBox::Ok))
         {
-            HandleGameOver();
+            HandleGameOver(true);
             this->close();
         }
     }
@@ -2600,12 +2601,62 @@ void MainWidget::ScoreSave(string gameResult)
     return;
 }
 
-void MainWidget::HandleGameOver()
+void MainWidget::HandleGameOver(bool won)
 {
-    //
+    if (gameOverHandled) return;
+    gameOverHandled = true;
+
     auto*p=player[NOWPLAYERREPRESENT];
-    ResultLogInfo(isWin(),usrScore.getScore(),p->getWood(),p->getFood(),p->getGold(),p->getScore()).LogOut();
+    ResultLogInfo(won, usrScore.getScore(), p->getWood(), p->getFood(),
+                  p->getGold(), p->getStone()).LogOut();
+    exportGameEndLog(won);
     GameOverBroadCast.broadcast();
+}
+
+void MainWidget::exportGameEndLog(bool won)
+{
+    const QString outputPath = QDir::current().absoluteFilePath("output");
+    QDir outputDir(outputPath);
+    if (!outputDir.exists() && !outputDir.mkpath(".")) {
+        qWarning() << "Failed to create game log directory:" << outputPath;
+        return;
+    }
+
+    const QString timestamp = QDateTime::currentDateTime().toString("yyyy-MM-dd_hh-mm-ss-zzz");
+    const QString fileName = outputDir.absoluteFilePath(
+        QString("game_end_%1_%2.txt").arg(won ? "win" : "loss", timestamp));
+    QFile file(fileName);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        qWarning() << "Failed to export game end log:" << file.errorString();
+        return;
+    }
+
+    Player* currentPlayer = player[NOWPLAYERREPRESENT];
+    Player* opponent = player[NOWPLAYERREPRESENT == 0 ? 1 : 0];
+    QTextStream out(&file);
+    out.setCodec("UTF-8");
+    out << "NewAOE game end log\n";
+    out << "result=" << (won ? "WIN" : "LOSS") << "\n";
+    out << "ended_at=" << QDateTime::currentDateTime().toString(Qt::ISODateWithMs) << "\n";
+    out << "elapsed_seconds=" << sel->getSecend() << "\n";
+    out << "frame=" << g_frame << "\n";
+    out << "score=" << usrScore.getScore() << "\n";
+    out << "enemy_score=" << enemyScore.getScore() << "\n";
+    out << "wood=" << currentPlayer->getWood() << "\n";
+    out << "food=" << currentPlayer->getFood() << "\n";
+    out << "stone=" << currentPlayer->getStone() << "\n";
+    out << "gold=" << currentPlayer->getGold() << "\n";
+    out << "units=" << currentPlayer->human.size() << "\n";
+    out << "buildings=" << currentPlayer->build.size() << "\n";
+    out << "enemy_units=" << opponent->human.size() << "\n";
+    out << "enemy_buildings=" << opponent->build.size() << "\n";
+    out << "\n[game_messages]\n";
+    const QString gameMessages = ui->DebugTexter->toPlainText();
+    out << gameMessages;
+    if (!gameMessages.endsWith('\n')) out << "\n";
+    file.close();
+
+    qInfo() << "Game end log exported to:" << fileName;
 }
 //**************槽函数***************
 // 游戏帧更新
